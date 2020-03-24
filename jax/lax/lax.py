@@ -4152,9 +4152,10 @@ def _tie_in_transpose_rule(t):
   return [ad_util.zero, t]
 
 def _tie_in_batch_rule(batched_args, batch_dims):
-  y = tie_in(*batched_args)
-  _, bdim_y = batch_dims
-  return y, bdim_y
+  x, y = batched_args
+  x_bd, y_bd = batch_dims
+  out = tie_in(x, y)
+  return out, y_bd
 
 tie_in_p = Primitive('tie_in')
 tie_in_p.def_impl(lambda x, y: y)

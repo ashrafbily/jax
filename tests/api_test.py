@@ -30,7 +30,7 @@ import concurrent.futures
 
 import jax
 import jax.numpy as np
-from jax import jit, grad, device_put, jacfwd, jacrev, hessian
+from jax import jit, grad, vmap, device_put, jacfwd, jacrev, hessian
 from jax import api, core, lax, lax_reference
 from jax.core import Primitive
 from jax.interpreters import ad
@@ -2228,7 +2228,7 @@ class CustomJVPTest(jtu.JaxTestCase):
   def test_pmap(self):
     raise unittest.SkipTest("TODO")  # TODO(mattjj): write test
 
-  def test_missing_jvp_rule_error_message(self):
+  def test_missing_jvp_rule_error(self):
     @api.custom_jvp
     def foo(x):
       return x ** 2
@@ -2246,7 +2246,7 @@ class CustomJVPTest(jtu.JaxTestCase):
         r"No JVP defined for custom_jvp function foo using defjvp.",
         lambda: api.grad(foo)(2.))
 
-  def test_jvp_rule_inconsistent_pytree_structures_error_message(self):
+  def test_jvp_rule_inconsistent_pytree_structures_error(self):
     @api.custom_jvp
     def f(x):
       return (x**2,)
@@ -2263,31 +2263,48 @@ class CustomJVPTest(jtu.JaxTestCase):
         re.escape(
             "Custom JVP rule must produce primal and tangent outputs "
             "with equal container (pytree) structures, but got "
-            "{} and {} respectively.".format(
+            "{} and {}.".format(
                 tree_util.tree_structure((1,)),
                 tree_util.tree_structure([1, 2]))
         ),
         lambda: api.jvp(f, (2.,), (1.,)))
 
-  def test_primal_tangent_aval_disagreement_error_message(self):
-    @api.custom_jvp
+  def test_multiple_rule_invocations(self):
+    from jax.scipy.special import expit
+
+    def scanned_fun(c, _):
+      return [expit(c[0])] + [c[i-1] + c[i] for i in range(1, len(c))], None
+
+    def foo(x):
+      c, _ = lax.scan(scanned_fun, [x, 0., 0., 0., 0.], None, length=10)
+      return c[-1]
+
+    # just make sure these don't crash
+    foo(3.)
+    grad(foo)(3.)
+    grad(lambda x: vmap(foo)(x).sum())(np.arange(3.))
+
+  def test_hard_stuff(self):
+    arr = np.ones((5, 2, 2))
+    api.jit(jax.vmap(np.linalg.det))(arr)  # doesn't crash
+
+  def test_hard_stuff2(self):
+    @jax.custom_jvp
     def f(x):
-      return x ** 2
+      return lax.tie_in(x, onp.zeros(x.shape, x.dtype))
 
     @f.defjvp
-    def foo_jvp(primals, tangents):
+    def f_jvp(primals, tangents):
       x, = primals
       t, = tangents
-      return f(x), np.reshape(t, (1,))
+      return f(x), t
 
-    f(2.)  # doesn't crash
-    self.assertRaisesRegex(
-        TypeError,
-        re.escape(
-            "Custom JVP rule must produce primal and tangent outputs "
-            "with equal shapes and dtypes, but got float32[] and float32[1] "
-            "respectively."),
-        lambda: api.jvp(f, (np.float32(2.),), (np.float32(1.),)))
+    # these don't crash
+    jax.jit(jax.vmap(f))(np.arange(3.))
+    jax.jit(jax.vmap(jax.grad(f)))(np.arange(3.))
+    jax.jit(jax.grad(lambda x: jax.vmap(f)(x).sum()))(np.arange(3.))
+    jax.grad(lambda x: jax.vmap(f)(x).sum())(np.arange(3.))
+    jax.jvp(jax.vmap(f), (np.arange(3.),), (np.ones(3),))
 
 
 class CustomVJPTest(jtu.JaxTestCase):

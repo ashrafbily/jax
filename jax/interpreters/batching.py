@@ -71,6 +71,19 @@ def _batch_fun2(in_dims, *in_vals, **params):
     del master
   yield out_vals
 
+@lu.transformation
+def batch_subtrace2(master, in_dims, *in_vals, **params):
+  trace = BatchTrace(master, core.cur_sublevel())
+  size, = {x.shape[d] for x, d in zip(in_vals, in_dims) if d is not not_mapped}
+  in_tracers = [BatchTracer(trace, val, dim) if dim is not None else val
+                for val, dim in zip(in_vals, in_dims)]
+  outs = yield in_tracers, params
+  out_tracers = map(trace.full_raise, outs)
+  out_vals, out_dims = unzip2((t.val, t.batch_dim) for t in out_tracers)
+  out_dim_dests = [0] * len(out_dims)
+  out_vals = map(partial(matchaxis, size), out_dims, out_dim_dests, out_vals)
+  yield out_vals
+
 
 ### tracer
 

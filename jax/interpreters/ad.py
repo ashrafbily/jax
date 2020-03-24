@@ -293,6 +293,8 @@ class JVPTrace(Trace):
 
   def process_primitive(self, primitive, tracers, params):
     primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
+    if not core.skip_checks:
+      map(_primal_tangent_shapes_match, primals_in, tangents_in)
     try:
       jvp = primitive_jvps[primitive]
     except KeyError as err:

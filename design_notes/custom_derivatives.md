@@ -337,15 +337,12 @@ simplicity, both `custom_jvp_call` and `custom_jvp_call_jaxpr` have partial eval
 rules that don’t do any nontrivial partial evaluation and instead stage
 everything out. That doesn’t constrain automatic differentiation because
 `custom_jvp_call_jaxpr`'s JVP rule doesn’t itself bind a call primitive but
-instead just invokes the custom JVP rule callable. Third, we don’t form a jaxpr
-for the JVP rule callable up-front, and instead keep it as a Python callable, to
-avoid a recursion problem: in the common case that the JVP rule itself calls the
+instead just invokes the custom JVP rule callable. Third, while we "morally"
+also form a jaxpr of the JVP rule up-front, there's an infinite recursion
+problem we solve with laziness (an explicit thunk) and memoization (to avoid
+redundant work): in the common case that the JVP rule itself calls the
 underlying custom-JVP function, we can’t trace the JVP rule up-front without
-getting an infinite recursion. By not forming a jaxpr, we’re solving this in the
-same way we always do: rules are Python callbacks invoked when a transformation
-is applied, not part of the primitive, and though the rule here is associated
-directly with the primitive, rather than being in a global dict, that’s just an
-implementation detail.)
+getting an infinite recursion.)
 
 If we gave up on [the Python flexibility
 problem](the-python-flexibility-problem), we could get away with only having
@@ -456,17 +453,3 @@ There are some other bells and whistles to the API:
   custom backward-pass function, and as a primitive it only has a transpose
   rule.
   * This mechanism is described more in [#636](https://github.com/google/jax/issues/636).
-* Added a variant of `transformation_with_aux` called
-  `transformation_with_equal_aux` to allow repeated stores of equal values due
-  to running the same function multiple times.
-  * The custom rules functions, like `f_jvp` and `f_fwd`/`f_bwd` in the examples
-  above, are not “linear” in the sense of linear_util.py when used in
-  `custom_jvp_call_jaxpr` and `custom_vjp_call_jaxpr`, respectively. They may be
-  invoked multiple times as a jaxpr is processed in initial style. It’s
-  usually fine for rules to be invoked multiple times, but these rules must
-  plumb aux data out to the api.py-level caller, namely output pytree aux
-  data.
-  * (Recall from a footnote above that we can’t solve this by forming jaxprs for
-  the rules up-front because that can lead to infinite recursion.)
-
-

@@ -20,7 +20,7 @@ import itertools as it
 from . import core
 from . import linear_util as lu
 from .tree_util import tree_flatten, tree_unflatten
-from .util import safe_zip, safe_map, unzip2, split_list, curry
+from .util import safe_zip, safe_map, unzip2, split_list
 from .api_util import flatten_fun_nokwargs, argnums_partial, wrap_hashably
 from .abstract_arrays import raise_to_shaped
 from .ad_util import zero
@@ -28,6 +28,7 @@ from .interpreters import partial_eval as pe
 from .interpreters import ad
 from .interpreters import batching
 from .interpreters import xla
+from .interpreters.batching import not_mapped
 
 map = safe_map
 zip = safe_zip
@@ -46,12 +47,20 @@ def _resolve_kwargs(fun, args, kwargs):
 def _initial_style_jaxpr(fun, in_avals):
   in_pvals = [pe.PartialVal((aval, core.unit)) for aval in in_avals]
   jaxpr, out_pvals, consts = pe.trace_to_jaxpr(fun, in_pvals, instantiate=True,
-                                               stage_out_calls=True)
+                                               stage_out_calls=False)
   out_avals = map(raise_to_shaped, unzip2(out_pvals)[0])
   const_avals = [raise_to_shaped(core.get_aval(c)) for c in consts]
   typed_jaxpr = core.TypedJaxpr(pe.convert_constvars_jaxpr(jaxpr),
                                 (), const_avals + in_avals, out_avals)
   return typed_jaxpr, consts
+
+def _memoize(thunk):
+  cell = []
+  def memoized():
+    if not cell:
+      cell.append(thunk())
+    return cell[0]
+  return memoized
 
 def _add_args(f, extra_args, left):
   return _add_args_(f, tuple(map(wrap_hashably, extra_args)), left)
@@ -62,23 +71,18 @@ def _add_args_(extra_args, left, *args, **kwargs):
   args = (extra_args + args) if left else (args + extra_args)
   yield (yield args, kwargs)
 
-@curry
-def transformation_with_equal_aux(gen, fun: lu.WrappedFun, *gen_static_args):
-  out_store = StoreEqualValues()
-  out_thunk = lambda: out_store.val
-  return fun.wrap(gen, gen_static_args, out_store), out_thunk
-
-class StoreEqualValues(lu.Store):
-  """A Store that allows storing equal values multiple times."""
-  def store(self, val):
-    if self._val is not lu._EMPTY_STORE_VALUE:
-      try:
-        same = self._val == val
-      except:
-        same = False
-      if not same:
-        raise lu.StoreException("Store occupied")
-    self._val = val
+def _custom_deriv_call_bind(primitive, f, *args, **params):
+  top_trace = core.find_top_trace(args)
+  level = (core.trace_state.trace_stack.next_level(True)
+           if top_trace is None else top_trace.level)
+  if top_trace is None:
+    with core.new_sublevel():
+      return primitive.impl(f, *args, **params)
+  else:
+    tracers = map(top_trace.full_raise, args)
+    outs = top_trace.process_call(primitive, f, tracers, params)
+    outs = map(core.full_lower, outs)
+  return outs
 
 
 ### JVPs
@@ -176,7 +180,7 @@ class custom_jvp:
     except lu.StoreException: out_tree = out_tree2()
     return tree_unflatten(out_tree, out_flat)
 
-@transformation_with_equal_aux
+@lu.transformation_with_aux
 def _flatten_jvp(in_tree, *args):
   primals_in, tangents_in = split_list(args, [len(args) // 2])
   py_primals = tree_unflatten(in_tree, primals_in)
@@ -205,24 +209,13 @@ def _flatten_jvp(in_tree, *args):
       raise TypeError(msg.format('\n'.join(disagreements)))
   yield primals_out + tangents_out, out_tree
 
-def _custom_deriv_call_bind(primitive, f, *args, **params):
-  top_trace = core.find_top_trace(args)
-  level = (core.trace_state.trace_stack.next_level(True)
-           if top_trace is None else top_trace.level)
-  if top_trace is None:
-    with core.new_sublevel():
-      return primitive.impl(f, *args, **params)
-  else:
-    tracers = map(top_trace.full_raise, args)
-    outs = top_trace.process_call(primitive, f, tracers, params)
-    outs = map(core.full_lower, outs)
-  return outs
-
 def _custom_call_impl(f, *args, **params):
   return f.call_wrapped(*args)
 
 custom_jvp_call_p = core.Primitive('custom_jvp_call')
+custom_jvp_call_p.call_primitive = True
 custom_jvp_call_p.multiple_results = True
+# custom_jvp_call = partial(core.call_bind, custom_jvp_call_p)
 custom_jvp_call = partial(_custom_deriv_call_bind, custom_jvp_call_p)
 custom_jvp_call_p.def_custom_bind(custom_jvp_call)
 custom_jvp_call_p.def_impl(_custom_call_impl)
@@ -239,62 +232,75 @@ ad.call_jvp_rules[custom_jvp_call_p] = _custom_jvp_call_jvp
 def _custom_jvp_call_vmap(trace, call_primitive, fun, tracers, params):
   in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in tracers)
   jvp = params['jvp']
-  fun, out_dims = batching.batch_subtrace(fun, trace.master, in_dims)
-  jvp, out_dims2 = batching.batch_subtrace(jvp, trace.master, in_dims * 2)
+  fun = batching.batch_subtrace2(fun, trace.master, in_dims)
+  jvp = batching.batch_subtrace2(jvp, trace.master, in_dims * 2)
+  # jvp, out_dims2 = batching.batch_subtrace(jvp, trace.master, in_dims * 2)  # TODO mattjj think about super fancy join
   out_vals = custom_jvp_call(fun, *in_vals, jvp=jvp)
-  try: out_dims = out_dims()
-  except lu.StoreException: out_dims = out_dims2()[:len(out_vals)]
-  return [batching.BatchTracer(trace, v, d) for v, d in zip(out_vals, out_dims)]
+  return [batching.BatchTracer(trace, v, 0) for v in out_vals]
 batching.call_batching_rules[custom_jvp_call_p] = _custom_jvp_call_vmap
 
 def _custom_jvp_call_partial_eval(trace, call_primitive, fun, tracers, params):
-  return custom_jvp_call_jaxpr(fun, params['jvp'], *tracers)
+  if trace.master.trace_type is pe.StagingJaxprTrace:
+    return fun.call_wrapped(*tracers)
+  else:
+    return custom_jvp_call_jaxpr(fun, params['jvp'], *tracers)
 pe.call_partial_eval_rules[custom_jvp_call_p] = _custom_jvp_call_partial_eval
 
 
 def custom_jvp_call_jaxpr(fun, jvp, *args):
   in_avals = [raise_to_shaped(core.get_aval(x)) for x in args]
   jaxpr, consts = _initial_style_jaxpr(fun, in_avals)
-  return custom_jvp_call_jaxpr_p.bind(*it.chain(consts, args), jaxpr=jaxpr,
-                                      jvp=jvp, num_consts=len(consts))
+  jvp_jaxpr_thunk = _memoize(lambda: _initial_style_jaxpr(jvp, 2 * in_avals))
+  return custom_jvp_call_jaxpr_p.bind(
+      *it.chain(consts, args), jaxpr=jaxpr, jvp_jaxpr_thunk=jvp_jaxpr_thunk,
+      num_consts=len(consts))
 
-def _custom_call_jaxpr_impl(*args, jaxpr, **kwargs):
-  del kwargs
+def _custom_call_jaxpr_impl(*args, jaxpr, **_):
   return core.jaxpr_as_fun(jaxpr)(*args)
 
-def _custom_call_jaxpr_abstract_eval(*args, jaxpr, **kwargs):
-  del kwargs
+def _custom_call_jaxpr_abstract_eval(*args, jaxpr, **_):
   return jaxpr.out_avals
 
-def _custom_jvp_call_jaxpr_jvp(primals, tangents, jaxpr, jvp, num_consts):
+def _custom_jvp_call_jaxpr_jvp(primals, tangents, jaxpr, jvp_jaxpr_thunk, num_consts):
   _, primals = split_list(primals, [num_consts])
   zero_tangents, tangents = split_list(tangents, [num_consts])
   assert all(t is zero for t in zero_tangents)
-  outs = jvp.call_wrapped(*(primals + tangents))
+  jvp_jaxpr, jvp_consts = jvp_jaxpr_thunk()
+  assert not any(isinstance(c, core.Tracer) for c in jvp_consts)
+  outs = core.jaxpr_as_fun(jvp_jaxpr)(*it.chain(jvp_consts, primals, tangents))
   primals_out, tangents_out = split_list(outs, [len(outs) // 2])
   return primals_out, tangents_out
 
-def _custom_jvp_call_jaxpr_vmap(args, in_dims, jaxpr, jvp, num_consts):
-  size, = {x.shape[d] for x, d in zip(args, in_dims)
-           if d is not batching.not_mapped}
-  args = [batching.moveaxis(x, d, 0) if d is not batching.not_mapped and d != 0
-          else x for x, d in zip(args, in_dims)]
-  in_batched = [d is not batching.not_mapped for d in in_dims]
+def _custom_jvp_call_jaxpr_vmap(args, in_dims, jaxpr, jvp_jaxpr_thunk, num_consts):
+  size, = {x.shape[d] for x, d in zip(args, in_dims) if d is not not_mapped}
+  consts, args = split_list(args, [num_consts])
+  consts_bd, args_bd = split_list(in_dims, [num_consts])
+  assert all(d is not_mapped for d in consts_bd)
   del in_dims
-  batched_jaxpr, out_batched = batching.batch_jaxpr(jaxpr, size, in_batched, False)
-  out_dims = [0 if b else batching.not_mapped for b in out_batched]
 
-  jvp_in_dims = [0 if b else batching.not_mapped for b in in_batched] * 2
-  batched_jvp = batching.batch_fun(jvp, jvp_in_dims, lambda: out_dims * 2)
+  args = [batching.moveaxis(x, d, 0) if d is not not_mapped and d != 0
+          else x for x, d in zip(args, args_bd)]
+  in_batched = [not_mapped] * len(consts) + [d is not not_mapped for d in args_bd]
+  batched_jaxpr, out_batched = batching.batch_jaxpr(jaxpr, size, in_batched, False)
+  out_dims = [0 if b else not_mapped for b in out_batched]
+
+  jvp_jaxpr, jvp_consts = jvp_jaxpr_thunk()
+  assert not any(isinstance(c, core.Tracer) for c in jvp_consts)
+  jvp_in_batched = ([not_mapped] * len(jvp_consts)
+                    + [d is not not_mapped for d in args_bd] * 2)
+  batched_jvp_jaxpr_thunk = _memoize(
+      lambda: (batching.batch_jaxpr(jvp_jaxpr, size, jvp_in_batched, False)[0],
+               jvp_consts))
 
   batched_outs = custom_jvp_call_jaxpr_p.bind(
-      *args, jaxpr=batched_jaxpr, jvp=batched_jvp, num_consts=num_consts)
+      *args, jaxpr=batched_jaxpr, jvp_jaxpr_thunk=batched_jvp_jaxpr_thunk,
+      num_consts=num_consts)
   return batched_outs, out_dims
 
 # If a (multi)linear function is defined with a custom jvp, then
 # custom_jvp_call_jaxpr can appear in jaxprs to be transposed. We transpose it
 # like a core.call.
-def _custom_jvp_call_jaxpr_transpose(cts, *args, jaxpr, **kwargs):
+def _custom_jvp_call_jaxpr_transpose(cts, *args, jaxpr, **_):
   name = 'custom_jvp_call_jaxpr_linear'
   return ad.call_transpose(core.call_p, dict(name=name), jaxpr.jaxpr,
                            tuple(jaxpr.literals) + args, cts)
@@ -424,12 +430,13 @@ class custom_vjp:
     return tree_unflatten(out_tree, out_flat)
 
 custom_vjp_call_p = core.Primitive('custom_vjp_call')
+custom_vjp_call_p.call_primitive = True
 custom_vjp_call_p.multiple_results = True
 custom_vjp_call = partial(_custom_deriv_call_bind, custom_vjp_call_p)
 custom_vjp_call_p.def_custom_bind(custom_vjp_call)
 custom_vjp_call_p.def_impl(_custom_call_impl)
 
-@transformation_with_equal_aux
+@lu.transformation_with_aux
 def _flatten_fwd(in_tree, *args):
   py_args = tree_unflatten(in_tree, args)
   py_outs, res = yield py_args, {}
@@ -509,16 +516,19 @@ ad.primitive_transposes[custom_lin_p] = _custom_lin_transpose
 def custom_vjp_call_jaxpr(fun, fwd, bwd, out_trees, *args):
   in_avals = [raise_to_shaped(core.get_aval(x)) for x in args]
   jaxpr, consts = _initial_style_jaxpr(fun, in_avals)
+  fwd_jaxpr_thunk = _memoize(lambda: _initial_style_jaxpr(fwd, in_avals))
   return custom_vjp_call_jaxpr_p.bind(
-      *it.chain(consts, args), jaxpr=jaxpr, fwd=fwd, bwd=bwd,
+      *it.chain(consts, args), jaxpr=jaxpr,
+      fwd_jaxpr_thunk=fwd_jaxpr_thunk, bwd=bwd,
       out_trees=out_trees, num_consts=len(consts))
 
-def _custom_vjp_call_jaxpr_jvp(primals, tangents, jaxpr, fwd, bwd, out_trees,
-                               num_consts):
+def _custom_vjp_call_jaxpr_jvp(primals, tangents, jaxpr, fwd_jaxpr_thunk, bwd,
+                               out_trees, num_consts):
   _, primals = split_list(primals, [num_consts])
   zero_tangents, tangents = split_list(tangents, [num_consts])
   assert all(t is zero for t in zero_tangents)
-  res_and_primals_out = fwd.call_wrapped(*primals)
+  fwd_jaxpr, fwd_consts = fwd_jaxpr_thunk()
+  res_and_primals_out = core.jaxpr_as_fun(fwd_jaxpr)(*it.chain(fwd_consts, primals))
   out_tree, res_tree = out_trees()
   res, primals_out = split_list(res_and_primals_out, [res_tree.num_leaves])
   avals_out = [raise_to_shaped(core.get_aval(x)) for x in primals_out]
@@ -527,24 +537,32 @@ def _custom_vjp_call_jaxpr_jvp(primals, tangents, jaxpr, fwd, bwd, out_trees,
       avals_out=avals_out)
   return primals_out, tangents_out
 
-def _custom_vjp_call_jaxpr_vmap(args, in_dims, jaxpr, fwd, bwd, out_trees,
-                                num_consts):
+def _custom_vjp_call_jaxpr_vmap(args, in_dims, jaxpr, fwd_jaxpr_thunk, bwd,
+                                out_trees, num_consts):
   size, = {x.shape[d] for x, d in zip(args, in_dims)
-           if d is not batching.not_mapped}
-  args = [batching.moveaxis(x, d, 0) if d is not batching.not_mapped and d != 0
+           if d is not not_mapped}
+  args = [batching.moveaxis(x, d, 0) if d is not not_mapped and d != 0
           else x for x, d in zip(args, in_dims)]
-  in_batched = [d is not batching.not_mapped for d in in_dims]
+  in_batched = [d is not not_mapped for d in in_dims]
   del in_dims
   batched_jaxpr, out_batched = batching.batch_jaxpr(jaxpr, size, in_batched, False)
-  out_dims = [0 if b else batching.not_mapped for b in out_batched]
+  out_dims = [0 if b else not_mapped for b in out_batched]
 
-  fwd_in_dims = [0 if b else batching.not_mapped for b in in_batched]
-  batched_fwd, fwd_out_dims = batching.batch_fun2(fwd, fwd_in_dims)
+  fwd_jaxpr, fwd_jaxpr_consts = fwd_jaxpr_thunk()
+  fwd_in_batched = [not_mapped] * len(fwd_jaxpr_consts) + in_batched
+  batched_fwd_jaxpr_thunk = _memoize(
+      lambda: (batching.batch_jaxpr(fwd_jaxpr, size, fwd_in_batched, False)[0],
+               fwd_jaxpr_consts))
+  # TODO(mattjj): could remove the redundant tracing work here w/ linear_util
+  def fwd_out_dims():
+    _, fwd_out_batched = batching.batch_jaxpr(fwd_jaxpr, size, fwd_in_batched, False)
+    return [0 if b else not_mapped for b in fwd_out_batched]
+  fwd_in_dims = [0 if b else not_mapped for b in in_batched]
   batched_bwd = batching.batch_fun(bwd, fwd_out_dims, fwd_in_dims)
 
   batched_outs = custom_vjp_call_jaxpr_p.bind(
-      *args, jaxpr=batched_jaxpr, fwd=batched_fwd, bwd=batched_bwd,
-      out_trees=out_trees, num_consts=num_consts)
+      *args, jaxpr=batched_jaxpr, fwd_jaxpr_thunk=batched_fwd_jaxpr_thunk,
+      bwd=batched_bwd, out_trees=out_trees, num_consts=num_consts)
   return batched_outs, out_dims
 
 custom_vjp_call_jaxpr_p = core.Primitive('custom_vjp_call_jaxpr')
